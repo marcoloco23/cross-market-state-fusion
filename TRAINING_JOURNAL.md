@@ -56,15 +56,16 @@ This creates an 18-dimensional state that captures both underlying asset dynamic
 | Position | Has position, side, PnL, time remaining |
 | Regime | Vol regime, trend regime |
 
-### Sparse Reward Challenge
+### Sparse Reward Signal
 
-Unlike continuous markets where PnL accrues gradually, binary markets only pay at resolution:
-- Enter at prob=0.55
-- Wait up to 15 minutes
-- Get +$0.45 if right, -$0.55 if wrong
-- No intermediate feedback
+The agent only receives reward when a position closes - either by selling before resolution or holding to market close. No intermediate feedback while holding.
 
-Credit assignment is hard. The agent must learn which early signals predict outcomes 15 minutes later.
+Example trade:
+- Buy UP token at 0.55, sell later at 0.65 → reward = +$0.10 × size
+- Buy UP token at 0.55, hold to resolution, market goes UP → reward = +$0.45 × size
+- Buy UP token at 0.55, hold to resolution, market goes DOWN → reward = -$0.55 × size
+
+This sparsity makes credit assignment harder. The agent takes actions every tick but only learns from realized PnL when positions close.
 
 ---
 
