@@ -182,7 +182,8 @@ If you use this work in your research, please cite:
 
 ```bibtex
 @software{cross_market_state_fusion,
-  author = {Humanplane},
+  author = {Saravanan, Nikshep},
+  organization = {HumanPlane},
   title = {Cross-Market State Fusion: RL Agents for Prediction Market Trading},
   year = {2025},
   url = {https://github.com/humanplane/cross-market-state-fusion}
