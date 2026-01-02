@@ -55,11 +55,29 @@ class Position:
 class TradingEngine:
     """
     Paper trading engine with strategy harness.
+    Supports optional live trading via --live flag.
     """
 
-    def __init__(self, strategy: Strategy, trade_size: float = 10.0):
+    def __init__(self, strategy: Strategy, trade_size: float = 10.0, live_mode: bool = False):
         self.strategy = strategy
         self.trade_size = trade_size
+        self.live_mode = live_mode
+
+        # Live execution setup
+        self.live_executor = None
+        if live_mode:
+            try:
+                from execution import SyncLiveExecutor
+                self.live_executor = SyncLiveExecutor(dry_run=False)
+                print("=" * 60)
+                print("LIVE TRADING MODE - REAL MONEY AT RISK")
+                print(f"  Dry run: {self.live_executor.dry_run}")
+                print(f"  Kill switch: {self.live_executor.kill_switch}")
+                print("=" * 60)
+            except Exception as e:
+                print(f"ERROR: Failed to initialize live executor: {e}")
+                print("Falling back to paper trading.")
+                self.live_mode = False
 
         # Streamers
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -133,12 +151,13 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute paper trade (and optionally live trade) with flexible sizing."""
         if action == Action.HOLD:
             return
 
         pos = self.positions.get(cid)
-        if not pos:
+        market = self.markets.get(cid)
+        if not pos or not market:
             return
 
         price = state.prob
@@ -147,6 +166,21 @@ class TradingEngine:
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
+                # Live execution: sell UP token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_up,
+                        outcome="Up",
+                        side="sell",
+                        size_usd=pos.size,
+                        limit_price=price,
+                    )
+                    if result.success:
+                        print(f"    LIVE CLOSE UP: {result.order_id}")
+                    else:
+                        print(f"    LIVE CLOSE UP FAILED: {result.error}")
+
                 shares = pos.size / pos.entry_price
                 pnl = (price - pos.entry_price) * shares
                 self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
@@ -157,6 +191,22 @@ class TradingEngine:
 
             elif action.is_buy and pos.side == "DOWN":
                 exit_down_price = 1 - price  # Current DOWN token price
+
+                # Live execution: sell DOWN token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_down,
+                        outcome="Down",
+                        side="sell",
+                        size_usd=pos.size,
+                        limit_price=exit_down_price,
+                    )
+                    if result.success:
+                        print(f"    LIVE CLOSE DOWN: {result.order_id}")
+                    else:
+                        print(f"    LIVE CLOSE DOWN FAILED: {result.error}")
+
                 shares = pos.size / pos.entry_price
                 pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
                 self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
@@ -170,6 +220,22 @@ class TradingEngine:
             size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
 
             if action.is_buy:
+                # Live execution: buy UP token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_up,
+                        outcome="Up",
+                        side="buy",
+                        size_usd=trade_amount,
+                        limit_price=price,
+                    )
+                    if result.success:
+                        print(f"    LIVE BUY UP: {result.order_id}")
+                    else:
+                        print(f"    LIVE BUY UP FAILED: {result.error}")
+                        return  # Don't update paper position on live failure
+
                 pos.side = "UP"
                 pos.size = trade_amount
                 pos.entry_price = price
@@ -180,13 +246,31 @@ class TradingEngine:
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
             elif action.is_sell:
+                down_price = 1 - price  # DOWN token price = 1 - UP prob
+
+                # Live execution: buy DOWN token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_down,
+                        outcome="Down",
+                        side="buy",
+                        size_usd=trade_amount,
+                        limit_price=down_price,
+                    )
+                    if result.success:
+                        print(f"    LIVE BUY DOWN: {result.order_id}")
+                    else:
+                        print(f"    LIVE BUY DOWN FAILED: {result.error}")
+                        return  # Don't update paper position on live failure
+
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                pos.entry_price = down_price
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price  # Keep original UP prob for reference
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}")
+                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {down_price:.3f}")
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
@@ -575,6 +659,7 @@ async def main():
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
+    parser.add_argument("--live", action="store_true", help="Enable LIVE trading on Polymarket (REAL MONEY)")
 
     args = parser.parse_args()
 
@@ -615,8 +700,30 @@ async def main():
         else:
             strategy.eval()
 
+    # Live trading safety confirmation
+    live_mode = False
+    if args.live:
+        print("\n" + "=" * 60)
+        print("WARNING: LIVE TRADING MODE")
+        print("=" * 60)
+        print("This will place REAL orders on Polymarket with REAL money!")
+        print(f"Trade size: ${args.size:.2f}")
+        print("\nMake sure you have:")
+        print("  1. Set up your .env with valid Polymarket credentials")
+        print("  2. Tested thoroughly in paper trading mode")
+        print("  3. Confirmed your account has sufficient balance")
+        print()
+
+        confirm = input("Type 'LIVE' to confirm live trading: ")
+        if confirm.strip() != "LIVE":
+            print("Live trading cancelled.")
+            return
+
+        print("\nStarting LIVE trading...")
+        live_mode = True
+
     # Run
-    engine = TradingEngine(strategy, trade_size=args.size)
+    engine = TradingEngine(strategy, trade_size=args.size, live_mode=live_mode)
     await engine.run()
 
 
