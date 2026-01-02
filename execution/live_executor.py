@@ -2,14 +2,13 @@
 Live execution adapter connecting RL agent to Polymarket.
 
 This module bridges the paper trading RL agent with real Polymarket execution
-using the Parallax project's PolymarketClient.
+using py-clob-client directly.
 """
 import asyncio
 import os
 import sys
-import uuid
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional
 from datetime import datetime
 
 # Add parent Parallax project to path for imports
@@ -17,9 +16,20 @@ PARALLAX_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 if PARALLAX_PATH not in sys.path:
     sys.path.insert(0, PARALLAX_PATH)
 
-# Load environment from Parallax .env
-from dotenv import load_dotenv
-load_dotenv(os.path.join(PARALLAX_PATH, ".env"))
+# Load environment from Parallax .env manually (dotenv has issues in some contexts)
+def load_env_file(path: str):
+    """Load .env file manually."""
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    value = value.strip('"').strip("'")
+                    if key not in os.environ or not os.environ[key]:
+                        os.environ[key] = value
+
+load_env_file(os.path.join(PARALLAX_PATH, ".env"))
 
 
 @dataclass
@@ -37,7 +47,7 @@ class LiveExecutor:
     """
     Async adapter to execute RL agent trades on Polymarket.
 
-    Uses the Parallax project's PolymarketClient for order execution.
+    Uses py-clob-client directly for order execution.
     Respects KILL_SWITCH and DRY_RUN environment variables.
     """
 
@@ -62,70 +72,69 @@ class LiveExecutor:
         print(f"  [LiveExecutor] dry_run={self.dry_run}, kill_switch={self.kill_switch}")
 
     def _init_client(self):
-        """Lazy initialization of Polymarket client."""
+        """Lazy initialization of py-clob-client."""
         if self._client_initialized:
             return
 
         try:
-            from src.external.polymarket_client import PolymarketClient, PolymarketClientConfig
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
 
-            config = PolymarketClientConfig(
-                api_base=os.getenv("POLYMARKET_API_BASE", "https://clob.polymarket.com"),
-                private_key=os.getenv("POLYMARKET_PRIVATE_KEY", ""),
-                proxy_address=os.getenv("POLYMARKET_PROXY_ADDRESS"),
-                signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
-                api_key=os.getenv("POLYMARKET_API_KEY"),
-                api_secret=os.getenv("POLYMARKET_API_SECRET"),
-                api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE"),
+            private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+            api_key = os.getenv("POLYMARKET_API_KEY")
+            api_secret = os.getenv("POLYMARKET_API_SECRET")
+            api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE")
+
+            if not private_key:
+                print("  [LiveExecutor] ERROR: POLYMARKET_PRIVATE_KEY not set")
+                self._client = None
+                self._client_initialized = True
+                return
+
+            # Build credentials if available
+            creds = None
+            if api_key and api_secret and api_passphrase:
+                creds = ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase
+                )
+                print(f"  [LiveExecutor] Using API credentials: {api_key[:20]}...")
+            else:
+                print("  [LiveExecutor] No API credentials found, deriving new ones...")
+
+            # Get proxy wallet config
+            proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+            signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0"))
+
+            # Create client with proxy wallet support
+            self._client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=private_key,
+                chain_id=137,  # Polygon
+                creds=creds,
+                signature_type=signature_type,
+                funder=proxy_address
             )
 
-            self._client = PolymarketClient(config)
+            # Derive credentials if not present
+            if not creds:
+                try:
+                    derived_creds = self._client.derive_api_key()
+                    self._client.set_api_creds(derived_creds)
+                    print(f"  [LiveExecutor] Derived new API key: {derived_creds.api_key[:20]}...")
+                except Exception as e:
+                    print(f"  [LiveExecutor] Failed to derive API key: {e}")
+
             self._client_initialized = True
-            print("  [LiveExecutor] Polymarket client initialized")
+            print("  [LiveExecutor] py-clob-client initialized")
 
         except Exception as e:
             print(f"  [LiveExecutor] Failed to initialize client: {e}")
+            import traceback
+            traceback.print_exc()
             self._client = None
             self._client_initialized = True
-
-    def _create_order_intent(
-        self,
-        condition_id: str,
-        token_id: str,
-        outcome: str,
-        side: str,
-        size_usd: float,
-        limit_price: float,
-    ):
-        """
-        Create an OrderIntent from RL agent trade data.
-
-        Args:
-            condition_id: Market condition ID
-            token_id: Token ID for the outcome being traded
-            outcome: "Up" or "Down"
-            side: "buy" or "sell"
-            size_usd: Trade size in USD
-            limit_price: Limit price (probability 0.0-1.0)
-        """
-        from src.data.models import OrderIntent
-
-        # Calculate token size from USD amount
-        size_tokens = size_usd / limit_price if limit_price > 0 else 0
-
-        # Generate unique idempotency key
-        idempotency_key = f"rl-{condition_id[:16]}-{uuid.uuid4().hex[:8]}"
-
-        return OrderIntent(
-            market_id=condition_id,
-            outcome=outcome,
-            side=side.lower(),
-            size_tokens=size_tokens,
-            limit_price=limit_price,
-            time_in_force="IOC",  # Immediate or Cancel for fast markets
-            idempotency_key=idempotency_key,
-            token_id=token_id,
-        )
 
     async def execute_trade(
         self,
@@ -175,34 +184,20 @@ class LiveExecutor:
                 timestamp=timestamp,
             )
 
-        # Create order intent
-        try:
-            intent = self._create_order_intent(
-                condition_id=condition_id,
-                token_id=token_id,
-                outcome=outcome,
-                side=side,
-                size_usd=size_usd,
-                limit_price=limit_price,
-            )
-        except Exception as e:
-            return ExecutionResult(
-                success=False,
-                error=f"Failed to create order: {e}",
-                timestamp=timestamp,
-            )
+        # Calculate token size from USD amount
+        size_tokens = size_usd / limit_price if limit_price > 0 else 0
 
         # Dry run: simulate success
         if self.dry_run:
             return ExecutionResult(
                 success=True,
-                order_id=f"DRY-{intent.idempotency_key}",
-                filled_size=intent.size_tokens,
+                order_id=f"DRY-{condition_id[:16]}-{outcome}",
+                filled_size=size_tokens,
                 avg_price=limit_price,
                 timestamp=timestamp,
             )
 
-        # Live execution
+        # Live execution using py-clob-client directly
         try:
             self._init_client()
 
@@ -213,22 +208,54 @@ class LiveExecutor:
                     timestamp=timestamp,
                 )
 
-            result = await self._client.execute_order_intent(intent)
+            from py_clob_client.order_builder.constants import BUY, SELL
+            from py_clob_client.clob_types import OrderArgs
 
-            order_id = result.get("orderID") or result.get("order_id") or "unknown"
+            # Map side to constant
+            order_side = BUY if side.lower() == "buy" else SELL
+
+            # Round price to tick size (0.01)
+            rounded_price = round(limit_price, 2)
+
+            # Create and post order using py-clob-client
+            print(f"    [CLOB] Placing {side.upper()} order: {size_tokens:.2f} tokens @ {rounded_price}")
+
+            # Build OrderArgs
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=rounded_price,
+                size=size_tokens,
+                side=order_side,
+            )
+
+            # Use create_and_post_order
+            order_result = self._client.create_and_post_order(order_args)
+
+            # Extract order ID from result
+            order_id = "unknown"
+            if isinstance(order_result, dict):
+                order_id = order_result.get("orderID") or order_result.get("id") or str(order_result)
+            else:
+                order_id = str(order_result)
+
+            print(f"    [CLOB] Order placed: {order_id}")
 
             return ExecutionResult(
                 success=True,
                 order_id=order_id,
-                filled_size=intent.size_tokens,
-                avg_price=limit_price,
+                filled_size=size_tokens,
+                avg_price=rounded_price,
                 timestamp=timestamp,
             )
 
         except Exception as e:
+            error_msg = str(e)
+            # Truncate cloudflare HTML if present
+            if "Cloudflare" in error_msg:
+                error_msg = "Cloudflare block (403)"
             return ExecutionResult(
                 success=False,
-                error=str(e),
+                error=f"Order failed: {error_msg}",
                 timestamp=timestamp,
             )
 
@@ -237,7 +264,9 @@ class LiveExecutor:
         try:
             self._init_client()
             if self._client:
-                return await self._client.get_account_balance()
+                # py-clob-client doesn't have a balance method directly
+                # Would need to use web3 for this
+                return None
         except Exception as e:
             print(f"  [LiveExecutor] Failed to get balance: {e}")
         return None
@@ -247,7 +276,7 @@ class SyncLiveExecutor:
     """
     Synchronous wrapper for LiveExecutor.
 
-    The RL agent's execute_action is synchronous, but PolymarketClient is async.
+    The RL agent's execute_action is synchronous, but we need async for some ops.
     This class provides a sync interface by managing an event loop.
     """
 
@@ -281,7 +310,7 @@ class SyncLiveExecutor:
         # Check if we're already in an async context
         try:
             asyncio.get_running_loop()
-            # We're in an async context - use nest_asyncio or run in thread
+            # We're in an async context - use thread pool
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(asyncio.run, coro)
